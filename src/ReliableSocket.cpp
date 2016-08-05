@@ -162,7 +162,9 @@ ReliableSocket::~ReliableSocket() {
 }
 
 void ReliableSocket::set_rto(long rtt) {
-    rto = 1.5*rtt + 20;
+	rto = 1.5*rtt;
+	if (rto < 30)
+		rto = 30;
     LOG(INFO) << "delay: " << rtt << "ms";
 }
 
@@ -185,6 +187,7 @@ void ReliableSocket::start_thread_sender() {
     /* Main Sender */
     std::thread([this]() {
 		exit_sender = false;
+		int fast_start_count = 0;
         PackageData *package_send;
         PackageAckObject ack_object;
         int list_package_size = 1400 * 80;
@@ -215,7 +218,18 @@ void ReliableSocket::start_thread_sender() {
                 list_package_count += package_send->length();
                 sendto(sock, package_send->get_buf(), package_send->length(), 0,
                        connected_addr, remote_len);
-//                std::cout << "Send package " << package_send->data_format->package_id << "\n";
+
+				//Fast start
+				if (fast_start) {
+					sendto(sock, package_send->get_buf(), package_send->length(), 0,
+						connected_addr, remote_len);
+					fast_start_count++;
+					if (fast_start_count == 10) {
+						fast_start_count = 0;
+						fast_start = false;
+					}
+				}
+
                 ack_object.data = package_send;
                 get_time_ms(ack_object.time_send);
 
@@ -288,6 +302,23 @@ void ReliableSocket::start_thread_sender() {
 		exit_resender = true;
     }).detach();
 
+	/* Ack Sender */
+	std::thread([this]() {
+		PackageAck ack_package;
+		while (worker_running) {
+			ack_send_mutex.lock();
+			netstruct::AckQueue ack_read_list = ack_send_queue;
+			ack_send_queue.rebase();
+			ack_send_mutex.unlock();
+			while (ack_read_list.size()) {
+				ack_package.parse(20, this->recv_ack_id, ack_read_list);
+				sendto(sock, ack_package.get_buf(), ack_package.length(), 0, connected_addr, remote_len);
+				sendto(sock, ack_package.get_buf(), ack_package.length(), 0, connected_addr, remote_len);
+			}
+			msleep(5);
+		}
+	}).detach();
+
 }
 
 void ReliableSocket::start_thread_ackhandler() {
@@ -326,7 +357,7 @@ void ReliableSocket::start_thread_ackhandler() {
                 get_time_ms(tv);
                 time_spend = get_ms(tv, ack_obj.time_send);
                 if (time_spend < rto) {
-                    msleep(5);
+                    msleep(rto - time_spend);
                 } else {
                     /* connection timeout, add to resend queue */
 //                  std::cout << "Ack timeout, resend package " << ack_obj.data->data_format->package_id << "\n";
@@ -462,7 +493,6 @@ int ReliableSocket::send_package(unsigned char *buf, int size) {
 
 void ReliableSocket::process_package(PackageBase *package) {
     PackagePing *recv_ping;
-    PackageAck *ack;
     PackageData *data;
     PackageAck *new_ack;
     PackageType type = package->get_type();
@@ -471,7 +501,7 @@ void ReliableSocket::process_package(PackageBase *package) {
 
     uint64_t ack_id;
     uint64_t ack_una;
-
+	uint64_t max_ack_id;
     switch (type) {
         case Ping:
             recv_ping = new PackagePing(package);
@@ -506,50 +536,50 @@ void ReliableSocket::process_package(PackageBase *package) {
             recv_mutex.unlock();
             recv_cv.signal();
 //            std::cout << "Send ack " << recv_package_id << " una " << recv_ack_id << "\n";
-            ack = new PackageAck(recv_package_id, recv_ack_id);
-            sendto(sock, ack->get_buf(), ack->length(), 0, connected_addr, remote_len);
+			ack_send_mutex.lock();
+			ack_send_queue.push(recv_package_id);
+			ack_send_mutex.unlock();
 
             /* Delete unneccessary ack */
             ack_recv_mutex.lock();
 			send_ack_id = recv_una;
             ack_recv_mutex.unlock();
-            delete ack;
             break;
         case Ack:
             new_ack = new PackageAck(package);
-            ack_id = new_ack->ack_format->package_id;
             ack_una = new_ack->ack_format->una;
-            delete new_ack;
 //            std::cout << "Receive ack " << ack_id << " una "
 //                      << ack_una << " resend " << resend_now << "\n";
             /* if una number is illegal. */
             if (ack_una > send_id) {
                 ack_una = 0;
             }
+			max_ack_id = 0;
             ack_recv_mutex.lock();
             /* If ack has already received, or ack number is illegal. */
-            if (ack_id <= send_ack_id || ack_id > send_id) {
-                ack_recv_mutex.unlock();
-                return;
-            }
-            if (ack_recv_pool.find(ack_id) != 0) {
-                ack_recv_mutex.unlock();
-                return;
-            }
-            ack_recv_pool.insert(ack_id);
+			for (int i = 0; i < new_ack->ack_format->ack_count; i++) {
+				ack_id = new_ack->ack_list[i];
+				if (ack_id <= send_ack_id || ack_id > send_id) {
+					continue;
+				}
+				max_ack_id = MAX(max_ack_id, ack_id);
+				if (ack_recv_pool.find(ack_id) != 0) {
+					continue;
+				}
+				ack_recv_pool.insert(ack_id);
+			}
 			send_ack_id = ack_una;
             while (ack_recv_pool.find(send_ack_id + 1) != 0) {
                 send_ack_id++;
             }
             ack_recv_mutex.unlock();
 
-
             /* fast resend */
             if (resend_now < send_ack_id)
                 resend_now = send_ack_id;
-            if (ack_id > resend_now + 2) {
+            if (max_ack_id > resend_now + 2) {
                 uint64_t resend_id = resend_now + 1;
-                while (resend_id < ack_id) {
+                while (resend_id < max_ack_id) {
                     ack_recv_mutex.lock();
                     bool found = ack_recv_pool.find(resend_id) != 0;
                     ack_recv_mutex.unlock();
@@ -564,6 +594,7 @@ void ReliableSocket::process_package(PackageBase *package) {
                 }
                 resend_now = ack_id;
             }
+			delete new_ack;
             break;
         case ConnectionClose:
             LOG(INFO) << "PACKAGE PROCESSING:connection close\n";

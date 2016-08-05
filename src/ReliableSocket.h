@@ -18,7 +18,6 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <queue>
-
 #endif // LINUX
 
 #ifdef TARGET_LINUX
@@ -26,7 +25,6 @@ typedef struct timeval time_struct_ms;
 #define get_time_ms(t) gettimeofday(&t, 0)
 #define get_ms(tv_a, tv_b) ((tv_a.tv_sec - tv_b.tv_sec) * 1000 + (tv_a.tv_usec - tv_b.tv_usec) / 1000)
 #define closesocket(sock) close(sock)
-#define msleep(s) usleep((s) * 1000)
 #endif // TARGET_LINUX
 
 #ifdef TARGET_WIN32
@@ -64,9 +62,9 @@ namespace netstruct {
 		void insert(uint64_t a) {
 			arr[a % size] = a;
 		}
-//		uint64_t operator[](uint64_t index) {
-//			return arr[index % size];
-//		}
+		//		uint64_t operator[](uint64_t index) {
+		//			return arr[index % size];
+		//		}
 		uint64_t find(uint64_t index) {
 			if (arr[index % size] != index) {
 				return 0;
@@ -77,6 +75,7 @@ namespace netstruct {
 			delete[] arr;
 		}
 	};
+
 	class PackageMap {
 	private:
 		PackageData **data_pointer_list;
@@ -112,7 +111,7 @@ namespace netstruct {
 		void erase(uint64_t index) {
 			if (arr_id[index % capacity] == index) {
 				arr_id[index % capacity] = 0;
-//				data_pointer_list[index % capacity] = nullptr;
+				//				data_pointer_list[index % capacity] = nullptr;
 			}
 		}
 		void push(PackageData *data, pthread::Mutex *mutex) {
@@ -148,6 +147,7 @@ namespace netstruct {
 			delete[] arr_id;
 		}
 	};
+
 	class PackageListMap {
 	private:
 		uint64_t *arr;
@@ -165,6 +165,10 @@ namespace netstruct {
 				arr[i] = 0;
 				data_list[i] = nullptr;
 			}
+		}
+		~PackageListMap() {
+			delete[] arr;
+			delete[] data_list;
 		}
 		//TODO if the cache is full
 		void push_back(PackageData *data, uint64_t id) {
@@ -193,6 +197,7 @@ namespace netstruct {
 		}
 		long size() { return len; }
 	};
+
 }
 
 typedef struct ClientSocketInfo {
@@ -213,6 +218,7 @@ protected:
     int upload_speed;
     int send_speed;
     bool worker_running = false;
+	bool fast_start = true;
 	std::list<ClientSocketInfo> client_socket_pool;
 
     struct sockaddr *remote_addr = new sockaddr();
@@ -226,7 +232,7 @@ protected:
     uint64_t send_id = 1;
     pthread::Mutex send_mutex;
     pthread::ConditionVariable send_cv;
-    netstruct::PackageMap send_pool = netstruct::PackageMap(100000);
+    netstruct::PackageMap send_pool = netstruct::PackageMap(10000);
     pthread::Mutex resend_mutex;
     pthread::ConditionVariable resend_cv;
     std::queue<PackageData*> resend_pool;
@@ -238,8 +244,11 @@ protected:
     pthread::ConditionVariable ack_cv;
     std::queue<PackageAckObject> ack_pool;
 
+	pthread::Mutex ack_send_mutex;
+	netstruct::AckQueue ack_send_queue = netstruct::AckQueue(10000);
+
     pthread::Mutex ack_recv_mutex;
-    netstruct::IdSet ack_recv_pool = netstruct::IdSet(100000);
+    netstruct::IdSet ack_recv_pool = netstruct::IdSet(10000);
 
     pthread::Mutex ping_mutex;
     pthread::ConditionVariable ping_cv;
@@ -248,7 +257,7 @@ protected:
     uint64_t recv_id = 1;
     pthread::Mutex recv_mutex;
     pthread::ConditionVariable recv_cv;
-    netstruct::PackageListMap recv_pool = netstruct::PackageListMap(100000);
+    netstruct::PackageListMap recv_pool = netstruct::PackageListMap(10000);
 
     void start_thread_sender();
     void start_thread_ackhandler();
